@@ -25,11 +25,47 @@ from dataclasses import dataclass
 import pysam
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, Field
 
+from . import normalize
 from .db import Conflict, Store
 from .vcfbuild import GZ_NAME, VCFError, validate_and_build
 
 DEFAULT_MAX_UPLOAD = 10 * 1024 * 1024  # 10 MiB
+
+
+class NormalizedRecord(BaseModel):
+    original: str = Field(description="Raw VCF line as published, unmodified")
+    original_pos: int = Field(description="POS as published (1-based)")
+    original_ref: str = Field(description="REF as published")
+    original_alt: str = Field(description="ALT as published")
+    pos: int = Field(description="Normalized 1-based POS")
+    ref: str = Field(description="Normalized REF")
+    alt: str = Field(description="Normalized ALT")
+    key: str = Field(description="Canonical key: chrom:pos:ref:alt")
+
+
+class NormalizeResponse(BaseModel):
+    version: int = Field(description="Published version that was normalized (pinned)")
+    chrom: str = Field(description="Chromosome shared by the reference and dataset")
+    count: int = Field(description="Number of records; one output per original record")
+    records: list[NormalizedRecord]
+
+
+async def _save_upload(file: UploadFile, dest: str, max_bytes: int) -> None:
+    """Stream an upload to `dest`, rejecting anything over the byte limit."""
+    size = 0
+    with open(dest, "wb") as out:
+        while True:
+            chunk = await file.read(1 << 20)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > max_bytes:
+                raise HTTPException(
+                    413, f"upload exceeds the {max_bytes}-byte limit"
+                )
+            out.write(chunk)
 
 
 @dataclass
@@ -144,7 +180,11 @@ def create_app(config: Config | None = None) -> FastAPI:
             "Tabix-indexed. Query 1-based closed intervals; every record whose "
             "reference span [POS, POS+len(REF)-1] intersects the interval is "
             "returned via the index. Uploads are optimistic-concurrency "
-            "controlled through `base_version`."
+            "controlled through `base_version`. `POST /normalize` left-aligns "
+            "and trims the published records against an uploaded single-record "
+            "ACGT FASTA reference, pinning the published version for the whole "
+            "computation. Interactive docs for both operations are served under "
+            "`/docs`."
         ),
     )
     app.state.cfg = cfg
@@ -164,18 +204,7 @@ def create_app(config: Config | None = None) -> FastAPI:
         os.makedirs(staging)
         try:
             upload_path = os.path.join(staging, "upload.vcf")
-            size = 0
-            with open(upload_path, "wb") as out:
-                while True:
-                    chunk = await file.read(1 << 20)
-                    if not chunk:
-                        break
-                    size += len(chunk)
-                    if size > cfg.max_upload_bytes:
-                        raise HTTPException(
-                            413, f"upload exceeds the {cfg.max_upload_bytes}-byte limit"
-                        )
-                    out.write(chunk)
+            await _save_upload(file, upload_path, cfg.max_upload_bytes)
             try:
                 chrom, n_records = await asyncio.to_thread(
                     validate_and_build, upload_path, staging
@@ -202,6 +231,66 @@ def create_app(config: Config | None = None) -> FastAPI:
             if os.path.isdir(staging):
                 shutil.rmtree(staging, ignore_errors=True)
         return {"version": new_version, "chrom": chrom, "n_records": n_records}
+
+    @app.post(
+        "/normalize",
+        response_model=NormalizeResponse,
+        responses={
+            400: {"description": "Invalid FASTA, chromosome mismatch, or REF/reference mismatch"},
+            404: {"description": "No VCF has been published yet"},
+            413: {"description": "Upload exceeds the byte limit"},
+        },
+    )
+    async def normalize_vcf(file: UploadFile = File(...)):
+        """Normalize the currently published VCF against an uploaded reference.
+
+        The published version is pinned before reading, so a publish that
+        happens while this request is computing does not change the dataset
+        being normalized: the response names the version actually used and the
+        current manifest is never modified.  The heavy work runs in a worker
+        thread, so uploads and interval queries stay responsive.
+        """
+        pinned = await asyncio.to_thread(store.pin, cfg.instance_id, time.time())
+        if pinned is None:
+            raise HTTPException(404, "no VCF has been published yet")
+        version, vchrom, rel, ref_id = pinned
+
+        staging = os.path.join(staging_root, uuid.uuid4().hex)
+        try:
+            os.makedirs(staging)
+            fasta_path = os.path.join(staging, "reference.fasta")
+            await _save_upload(file, fasta_path, cfg.max_upload_bytes)
+            try:
+                reference = await asyncio.to_thread(normalize.read_fasta, fasta_path)
+            except normalize.FastaError as exc:
+                raise HTTPException(400, f"invalid FASTA: {exc}")
+
+            if reference.chrom != vchrom:
+                raise HTTPException(
+                    400,
+                    f"reference chromosome '{reference.chrom}' does not match the "
+                    f"published dataset chromosome '{vchrom}'",
+                )
+            gz_path = os.path.join(cfg.data_dir, rel, GZ_NAME)
+            try:
+                records = await asyncio.to_thread(
+                    normalize.normalize_dataset, gz_path, reference
+                )
+            except normalize.NormalizationError as exc:
+                # Whole request fails; no partial result is returned.
+                raise HTTPException(400, f"reference mismatch: {exc}")
+            except RuntimeError as exc:
+                raise HTTPException(500, f"cannot normalize published VCF: {exc}")
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+            await asyncio.to_thread(store.unpin, ref_id)
+
+        return {
+            "version": version,
+            "chrom": vchrom,
+            "count": len(records),
+            "records": records,
+        }
 
     @app.get("/variants")
     def get_variants(
